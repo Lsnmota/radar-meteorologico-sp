@@ -96,7 +96,10 @@ def buscar_cidades_sp_acima_de(populacao_minima):
   return pd.DataFrame(linhas).sort_values("populacao", ascending=False)
 
 
-def geocodificar(nome):
+import time
+
+
+def geocodificar(nome, max_tentativas=3):
   url = "https://geocoding-api.open-meteo.com/v1/search"
   params = {
       "name": nome,
@@ -105,15 +108,35 @@ def geocodificar(nome):
       "format": "json",
       "countryCode": "BR",
   }
-  r = requests.get(url, params=params, timeout=30)
-  results = r.json().get("results", [])
-  for res in results:
-    if "são paulo" in (res.get("admin1") or "").lower():
-      return (res["latitude"], res["longitude"])
-  if results:
-    return (results[0]["latitude"], results[0]["longitude"])
-  return None
 
+  for tentativa in range(1, max_tentativas + 1):
+    try:
+      # Aumenta o timeout para 15s e aguarda em caso de instabilidade
+      r = requests.get(url, params=params, timeout=15)
+      r.raise_for_status()
+      results = r.json().get("results", [])
+
+      # Pausa de 0.2s para evitar overload no servidor
+      time.sleep(0.2)
+
+      for res in results:
+        if "são paulo" in (res.get("admin1") or "").lower():
+          return (res["latitude"], res["longitude"])
+
+      if results:
+        return (results[0]["latitude"], results[0]["longitude"])
+
+      return None
+
+    except (requests.RequestException, Exception) as e:
+      print(
+          f"Aviso: tentativa {tentativa}/{max_tentativas} falhou para"
+          f" '{nome}': {e}"
+      )
+      time.sleep(2 * tentativa)  # Espera 2s, 4s, 6s antes de re-tentar
+
+  print(f"Erro: Não foi possível obter coordenadas para '{nome}'.")
+  return None
 
 def buscar_probabilidade_chuva_media(
     dict_coordenadas, data_inicio, data_fim, timezone=TIMEZONE
