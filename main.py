@@ -1,66 +1,28 @@
-# Radar Meteorológico do Estado de SP
-
-Este notebook gera uma planilha Excel com a **probabilidade de chuva** (%) para os próximos dias, para:
-
-1. Todas as cidades do estado de São Paulo com mais de 100 mil habitantes (dados de população do **IBGE**, buscados automaticamente e sempre atualizados).
-2. Os bairros da cidade de São Paulo (capital), em uma aba separada.
-
-**Fontes de dados:**
-- População dos municípios: API de localidades do IBGE + tabela SIDRA 6579 (estimativas populacionais).
-- Coordenadas geográficas das cidades: API de geocodificação da [Open-Meteo](https://open-meteo.com).
-- Previsão de chuva: API de previsão do tempo da [Open-Meteo](https://open-meteo.com) (gratuita, sem necessidade de chave de API).
-
-**Limitações importantes:**
-- A Open-Meteo fornece probabilidade de precipitação para um período de até ~92 dias no passado e ~16 dias no futuro, a partir da data em que o notebook é executado. Datas fora dessa janela não retornam dados.
-- A resolução dos modelos meteorológicos é de alguns quilômetros. Isso significa que bairros muito próximos entre si podem apresentar valores iguais ou muito parecidos — a granularidade "por bairro" é uma aproximação, não uma medição hiperlocal.
-- A lista de bairros da capital é uma lista curada (editável na célula de configuração), já que a API de geocodificação não cobre bairros de forma confiável.
-
-Basta rodar as células em ordem. A célula 2 (Configurações) é o único lugar que você normalmente precisa editar.
-
-
-## 1. Instalar/importar dependências
-
-# As bibliotecas abaixo já vêm instaladas no Google Colab na maioria dos casos.
-# O pip install garante que estejam disponíveis mesmo assim.
-!pip install --quiet openpyxl requests pandas
-
-import time
 import datetime as dt
-
-import requests
+import os
+import smtplib
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 import pandas as pd
+
 from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment
 from openpyxl.formatting.rule import ColorScaleRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill
 from openpyxl.utils import get_column_letter
+import requests
 
-print("Bibliotecas carregadas com sucesso.")
-
-
-## 2. Configurações — ajuste aqui
-
-- `DATA_INICIO` / `DATA_FIM`: período desejado, formato `AAAA-MM-DD`. Exemplo do enunciado: 1 a 20 de setembro.
-  Lembre-se do limite da API: aproximadamente 92 dias no passado e 16 dias no futuro, contados a partir de **hoje** (data em que a célula é executada).
-- `POPULACAO_MINIMA`: filtro de população dos municípios (padrão: 100.000).
-- `BAIRROS_SP`: lista de bairros da capital que entrarão na segunda aba. Adicione, remova ou ajuste as coordenadas (latitude, longitude) livremente.
-
-
-# ----------------------- PERÍODO DA PREVISÃO -----------------------
+# ==============================================================================
+# CONFIGURAÇÕES E PARÂMETROS
+# ==============================================================================
 hoje = dt.date.today()
-
 DATA_INICIO = (hoje - dt.timedelta(days=20)).strftime("%Y-%m-%d")  # D-20
 DATA_FIM = (hoje + dt.timedelta(days=7)).strftime("%Y-%m-%d")  # D+7
 
-# ----------------------- FILTRO DE POPULAÇÃO ------------------------
 POPULACAO_MINIMA = 100_000
-
-# ----------------------- FUSO HORÁRIO --------------------------------
 TIMEZONE = "America/Sao_Paulo"
-
-# ----------------------- NOME DO ARQUIVO DE SAÍDA --------------------
 ARQUIVO_SAIDA = f"radar_chuva_sp_{DATA_INICIO}_a_{DATA_FIM}.xlsx"
 
-# ----------------------- BAIRROS DA CAPITAL (aba 2) -------------------
 BAIRROS_SP = {
     "Sé (Centro)": (-23.5505, -46.6333),
     "Bela Vista": (-23.5590, -46.6534),
@@ -96,454 +58,309 @@ BAIRROS_SP = {
     "Parelheiros": (-23.8153, -46.7517),
 }
 
-print(f"Data de execução (D-0): {hoje.strftime('%Y-%m-%d')}")
-print(f"Período: {DATA_INICIO} a {DATA_FIM}")
-print(f"População mínima: {POPULACAO_MINIMA:,}".replace(",", "."))
-print(f"Bairros configurados: {len(BAIRROS_SP)}")
 
-## 3. Cidades de SP com população acima do limite (IBGE)
-
-Busca em duas etapas, ligadas pelo código IBGE de cada município (mais confiável do que casar pelo nome):
-
-1. Lista de todos os municípios do estado de SP (`/localidades/estados/SP/municipios`).
-2. Estimativa populacional mais recente de cada município (tabela SIDRA 6579, variável 9324).
-
-
-def buscar_municipios_sp():
-    '''Retorna dict {codigo_ibge (str): nome_do_municipio}.'''
-    url = "https://servicodados.ibge.gov.br/api/v1/localidades/estados/SP/municipios"
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    return {str(m["id"]): m["nome"] for m in r.json()}
-
-
-def buscar_populacao_estimada():
-    '''Retorna dict {codigo_ibge (str): populacao (int)} com a estimativa mais recente
-    disponível na tabela SIDRA 6579 (Estimativas de População) para todos os municípios do Brasil.'''
-    url = (
-        "https://servicodados.ibge.gov.br/api/v3/agregados/6579/periodos/-1"
-        "/variaveis/9324?localidades=N6[all]"
-    )
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    dados = r.json()
-
-    populacao = {}
-    for variavel in dados:
-        for resultado in variavel.get("resultados", []):
-            for serie in resultado.get("series", []):
-                codigo = str(serie["localidade"]["id"])
-                valores = serie.get("serie", {})
-                if not valores:
-                    continue
-                ultimo_periodo = sorted(valores.keys())[-1]
-                valor = valores[ultimo_periodo]
-                try:
-                    populacao[codigo] = int(valor)
-                except (TypeError, ValueError):
-                    continue  # valor não disponível ("...", "-", etc.)
-    return populacao
-
-
+# ==============================================================================
+# FUNÇÕES DE DADOS (IBGE + GEO + OPEN-METEO)
+# ==============================================================================
 def buscar_cidades_sp_acima_de(populacao_minima):
-    municipios = buscar_municipios_sp()
-    populacao = buscar_populacao_estimada()
+  r_mun = requests.get(
+      "https://servicodados.ibge.gov.br/api/v1/localidades/estados/SP/municipios",
+      timeout=30,
+  )
+  municipios = {str(m["id"]): m["nome"] for m in r_mun.json()}
 
-    linhas = []
-    for codigo, nome in municipios.items():
-        pop = populacao.get(codigo)
-        if pop is not None and pop >= populacao_minima:
-            linhas.append({"codigo_ibge": codigo, "cidade": nome, "populacao": pop})
+  r_pop = requests.get(
+      "https://servicodados.ibge.gov.br/api/v3/agregados/6579/periodos/-1/variaveis/9324?localidades=N6[all]",
+      timeout=60,
+  )
+  pop_data = r_pop.json()
+  populacao = {}
+  for var in pop_data:
+    for res in var.get("resultados", []):
+      for s in res.get("series", []):
+        cod = str(s["localidade"]["id"])
+        vals = s.get("serie", {})
+        if vals:
+          last_k = sorted(vals.keys())[-1]
+          try:
+            populacao[cod] = int(vals[last_k])
+          except (TypeError, ValueError):
+            pass
 
-    df = pd.DataFrame(linhas).sort_values("populacao", ascending=False).reset_index(drop=True)
-    return df
+  linhas = []
+  for cod, nome in municipios.items():
+    p = populacao.get(cod)
+    if p is not None and p >= populacao_minima:
+      linhas.append({"cidade": nome, "populacao": p})
 
-
-print("Buscando dados de população no IBGE...")
-df_cidades = buscar_cidades_sp_acima_de(POPULACAO_MINIMA)
-print(f"{len(df_cidades)} cidades encontradas com população >= {POPULACAO_MINIMA:,}.".replace(",", "."))
-df_cidades.head(15)
-
-
-## 4. Geocodificação (coordenadas de cada cidade)
-
-Usa a API de geocodificação da Open-Meteo, com preferência por resultados cujo estado (`admin1`) seja São Paulo, para evitar confusão com cidades homônimas em outros estados.
-
-
-import requests
-import time
-
-CACHE_GEOCODIFICACAO = {}
-
-def geocodificar(nome, estado_preferido="São Paulo", pais="BR", max_tentativas=3):
-    if nome in CACHE_GEOCODIFICACAO:
-        return CACHE_GEOCODIFICACAO[nome]
-
-    url = "https://geocoding-api.open-meteo.com/v1/search"
-    params = {
-        "name": nome,
-        "count": 10,
-        "language": "pt",
-        "format": "json",
-        "countryCode": pais
-    }
-
-    for tentativa in range(1, max_tentativas + 1):
-        try:
-            r = requests.get(url, params=params, timeout=60)
-            r.raise_for_status()
-            resultados = r.json().get("results", []) or []
-            break
-        except requests.RequestException as e:
-            if tentativa == max_tentativas:
-                print(f"AVISO: erro ao geocodificar '{nome}' após {max_tentativas} tentativas: {e}")
-                CACHE_GEOCODIFICACAO[nome] = None
-                return None
-            time.sleep(2 * tentativa) # Pausa progressiva antes de tentar de novo
-
-    escolhido = next(
-        (res for res in resultados if estado_preferido.lower() in (res.get("admin1") or "").lower()),
-        None,
-    )
-    if escolhido is None and resultados:
-        escolhido = resultados[0]
-        print(f"AVISO: '{nome}' — não encontrei resultado em {estado_preferido}, usando o melhor resultado disponível ({escolhido.get('admin1')}, {escolhido.get('country')}).")
-
-    if escolhido is None:
-        print(f"AVISO: '{nome}' — não foi possível geocodificar, cidade será omitida da planilha.")
-        CACHE_GEOCODIFICACAO[nome] = None
-        return None
-
-    coord = (escolhido["latitude"], escolhido["longitude"])
-    CACHE_GEOCODIFICACAO[nome] = coord
-    return coord
-
-print("Geocodificando cidades com sistema de nova tentativa...")
-coordenadas_cidades = {}
-for i, nome in enumerate(df_cidades["cidade"], start=1):
-    coord = geocodificar(nome)
-    if coord is not None:
-        coordenadas_cidades[nome] = coord
-    if i % 20 == 0:
-        print(f"  {i}/{len(df_cidades)} processadas...")
-    time.sleep(0.3)  # Aumentado levemente para respeitar o limite da API pública
-
-print(f"Concluído: {len(coordenadas_cidades)}/{len(df_cidades)} cidades geocodificadas.")
-coordenadas_bairros = dict(BAIRROS_SP)
-
-## 5. Previsão de probabilidade de chuva (Open-Meteo)
-
-Faz requisições em lotes (várias localidades por chamada) para reduzir o número de chamadas à API.
-O resultado é uma tabela com uma linha por localidade e uma coluna por dia, com a probabilidade máxima diária de precipitação (0 a 1, onde 1 = 100%).
+  return pd.DataFrame(linhas).sort_values("populacao", ascending=False)
 
 
-
-
-import pandas as pd
-import requests
-
-# ==============================================================================
-# FUNÇÃO DE BUSCA NA API OPEN-METEO
-# ==============================================================================
+def geocodificar(nome):
+  url = "https://geocoding-api.open-meteo.com/v1/search"
+  params = {
+      "name": nome,
+      "count": 5,
+      "language": "pt",
+      "format": "json",
+      "countryCode": "BR",
+  }
+  r = requests.get(url, params=params, timeout=30)
+  results = r.json().get("results", [])
+  for res in results:
+    if "são paulo" in (res.get("admin1") or "").lower():
+      return (res["latitude"], res["longitude"])
+  if results:
+    return (results[0]["latitude"], results[0]["longitude"])
+  return None
 
 
 def buscar_probabilidade_chuva_media(
-    dict_coordenadas,
-    data_inicio,
-    data_fim,
-    timezone=TIMEZONE,
-    tamanho_lote=50,
+    dict_coordenadas, data_inicio, data_fim, timezone=TIMEZONE
 ):
-  """dict_coordenadas: {nome: (lat, lon)}.
-
-  Retorna um DataFrame: índice = nomes, colunas = datas (datetime.date), valores
-  = probabilidade média diária (0 a 1).
-  """
   nomes = list(dict_coordenadas.keys())
   coords = list(dict_coordenadas.values())
-  todas_datas = list(
-      pd.date_range(data_inicio, data_fim, freq="D").date
+  todas_datas = list(pd.date_range(data_inicio, data_fim, freq="D").date)
+  resultado = pd.DataFrame(index=nomes, columns=todas_datas, dtype=float)
+
+  params = {
+      "latitude": ",".join(str(c[0]) for c in coords),
+      "longitude": ",".join(str(c[1]) for c in coords),
+      "hourly": "precipitation_probability",
+      "timezone": timezone,
+      "start_date": str(data_inicio),
+      "end_date": str(data_fim),
+  }
+
+  r = requests.get(
+      "https://api.open-meteo.com/v1/forecast", params=params, timeout=60
   )
-  resultado = pd.DataFrame(
-      index=nomes, columns=todas_datas, dtype=float
-  )
+  dados = r.json()
+  if isinstance(dados, dict):
+    dados = [dados]
 
-  for inicio in range(0, len(nomes), tamanho_lote):
-    lote_nomes = nomes[inicio : inicio + tamanho_lote]
-    lote_coords = coords[inicio : inicio + tamanho_lote]
-
-    params = {
-        "latitude": ",".join(str(c[0]) for c in lote_coords),
-        "longitude": ",".join(str(c[1]) for c in lote_coords),
-        "hourly": "precipitation_probability",
-        "timezone": timezone,
-        "start_date": str(data_inicio),
-        "end_date": str(data_fim),
-    }
-
-    try:
-      r = requests.get(
-          "https://api.open-meteo.com/v1/forecast",
-          params=params,
-          timeout=60,
-      )
-      r.raise_for_status()
-      dados = r.json()
-    except requests.RequestException as e:
-      print(f"AVISO: falha ao buscar previsão para o lote {lote_nomes}: {e}")
-      continue
-
-    if isinstance(dados, dict):
-      dados = [dados]
-
-    for nome, res in zip(lote_nomes, dados):
-      if (
-          "hourly" not in res
-          or "precipitation_probability" not in res["hourly"]
-      ):
-        continue
-
-      df_hourly = pd.DataFrame({
+  for nome, res in zip(nomes, dados):
+    if "hourly" in res and "precipitation_probability" in res["hourly"]:
+      df_h = pd.DataFrame({
           "time": pd.to_datetime(res["hourly"]["time"]),
-          "prob": res["hourly"]["precipitation_probability"],
+          "prob": [
+              p / 100.0 for p in res["hourly"]["precipitation_probability"]
+          ],
       })
-      df_hourly["prob"] = df_hourly["prob"] / 100.0  # Converte % para decimal (0 a 1)
-      df_hourly["data"] = df_hourly["time"].dt.date
-
-      # Média diária da probabilidade
-      media_diaria = df_hourly.groupby("data")["prob"].mean()
-      resultado.loc[nome] = media_diaria
+      df_h["data"] = df_h["time"].dt.date
+      resultado.loc[nome] = df_h.groupby("data")["prob"].mean()
 
   return resultado
 
 
 # ==============================================================================
-# EXECUÇÃO DA BUSCA PARA CIDADES E BAIRROS
+# GERAÇÃO DO EXCEL
 # ==============================================================================
+def gerar_excel(df_cidades_completo, df_prob_bairros, caminho_saida):
+  wb = Workbook()
 
-print("Buscando previsão de chuva para as cidades de SP...")
-df_prob_cidades = buscar_probabilidade_chuva_media(
-    coordenadas_cidades, DATA_INICIO, DATA_FIM
-)
+  font_header = Font(name="Calibri", size=11, bold=True, color="000000")
+  font_estado = Font(name="Calibri", size=11, bold=True, color="000000")
+  font_normal = Font(name="Calibri", size=11, bold=False, color="000000")
 
-print("Buscando previsão de chuva para os bairros da Capital...")
-df_prob_bairros = buscar_probabilidade_chuva_media(
-    coordenadas_bairros, DATA_INICIO, DATA_FIM
-)
+  fill_header = PatternFill(
+      start_color="F2F2F2", end_color="F2F2F2", fill_type="solid"
+  )
+  fill_estado = PatternFill(
+      start_color="E6EDF5", end_color="E6EDF5", fill_type="solid"
+  )
 
-print("Previsões obtidas com sucesso!")
+  align_center = Alignment(horizontal="center", vertical="center")
+  align_left = Alignment(horizontal="left", vertical="center")
+  thin_border = Border(
+      left=Side(style="thin", color="D9D9D9"),
+      right=Side(style="thin", color="D9D9D9"),
+      top=Side(style="thin", color="D9D9D9"),
+      bottom=Side(style="thin", color="D9D9D9"),
+  )
 
-## 6. Gerar a planilha Excel
+  dias_semana_pt = {
+      "Mon": "Seg",
+      "Tue": "Ter",
+      "Wed": "Qua",
+      "Thu": "Qui",
+      "Fri": "Sex",
+      "Sat": "Sáb",
+      "Sun": "Dom",
+  }
+  meses_pt = {
+      1: "Jan",
+      2: "Fev",
+      3: "Mar",
+      4: "Abr",
+      5: "Mai",
+      6: "Jun",
+      7: "Jul",
+      8: "Ago",
+      9: "Set",
+      10: "Out",
+      11: "Nov",
+      12: "Dez",
+  }
 
-Duas abas — **Cidades SP** e **SP Capital - Bairros** — cada uma com:
-- cabeçalho duplo (dia da semana / data),
-- valores em formato de porcentagem,
-- escala de cores condicional (verde → amarelo → vermelho, de 0% a 100%).
-
-
-import pandas as pd
-from openpyxl import Workbook
-from openpyxl.formatting.rule import ColorScaleRule
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
-
-# ==============================================================================
-# 1. PREPARAÇÃO DOS DADOS
-# ==============================================================================
-
-# Calcula a média do Estado de São Paulo (média diária entre todas as cidades)
-sp_estado_media = pd.DataFrame(
-    [df_prob_cidades.mean(axis=0)],
-    index=["Estado de São Paulo"],
-    columns=df_prob_cidades.columns,
-)
-
-# Consolida a tabela de cidades com o Estado no topo
-df_cidades_completo = pd.concat([sp_estado_media, df_prob_cidades])
-
-# ==============================================================================
-# 2. CRIAÇÃO E ESTILIZAÇÃO DO WORKBOOK
-# ==============================================================================
-
-wb = Workbook()
-
-# Estilos reutilizáveis
-font_header_dias = Font(name="Calibri", size=11, bold=True, color="000000")
-font_header_datas = Font(name="Calibri", size=11, bold=True, color="000000")
-font_estado = Font(name="Calibri", size=11, bold=True, color="000000")
-font_normal = Font(name="Calibri", size=11, bold=False, color="000000")
-
-fill_header = PatternFill(
-    start_color="F2F2F2", end_color="F2F2F2", fill_type="solid"
-)
-fill_estado = PatternFill(
-    start_color="E6EDF5", end_color="E6EDF5", fill_type="solid"
-)  # Destaque leve para o Estado
-
-align_center = Alignment(horizontal="center", vertical="center")
-align_left = Alignment(horizontal="left", vertical="center")
-
-thin_border = Border(
-    left=Side(style="thin", color="D9D9D9"),
-    right=Side(style="thin", color="D9D9D9"),
-    top=Side(style="thin", color="D9D9D9"),
-    bottom=Side(style="thin", color="D9D9D9"),
-)
-
-# Mapeamento de dias da semana em português (3 letras)
-dias_semana_pt = {
-    "Mon": "Seg",
-    "Tue": "Ter",
-    "Wed": "Qua",
-    "Thu": "Qui",
-    "Fri": "Sex",
-    "Sat": "Sáb",
-    "Sun": "Dom",
-}
-
-
-def criar_aba_formatada(ws, df_dados, titulo_coluna_principal, eh_aba_cidades):
+  def criar_aba(ws, df_dados, eh_cidades):
     ws.views.sheetView[0].showGridLines = True
 
-    # --------------------------------------------------------------------------
-    # Linha 1: Cabeçalho com Dias da Semana
-    # --------------------------------------------------------------------------
-    row1 = [titulo_coluna_principal]
-    for d in df_dados.columns:
-        dia_ing = d.strftime("%a")
-        row1.append(dias_semana_pt.get(dia_ing, dia_ing))
+    # Linha 1: Dias
+    row1 = ["Dia"] + [
+        dias_semana_pt.get(d.strftime("%a"), d.strftime("%a"))
+        for d in df_dados.columns
+    ]
     ws.append(row1)
 
-    # --------------------------------------------------------------------------
-    # Linha 2: Cabeçalho com Datas (ex: Set-01, Set-02)
-    # --------------------------------------------------------------------------
-    row2 = ["Cidade" if eh_aba_cidades else "Bairro"]
-    for d in df_dados.columns:
-        # Formata data como Mmm-DD (ex: Set-01, Ago-28)
-        meses_pt = {
-            1: "Jan",
-            2: "Fev",
-            3: "Mar",
-            4: "Abr",
-            5: "Mai",
-            6: "Jun",
-            7: "Jul",
-            8: "Ago",
-            9: "Set",
-            10: "Out",
-            11: "Nov",
-            12: "Dez",
-        }
-        str_data = f"{meses_pt[d.month]}-{d.day:02d}"
-        row2.append(str_data)
+    # Linha 2: Datas
+    row2 = ["Cidade" if eh_cidades else "Bairro"] + [
+        f"{meses_pt[d.month]}-{d.day:02d}" for d in df_dados.columns
+    ]
     ws.append(row2)
 
-    # --------------------------------------------------------------------------
-    # Linhas de Dados
-    # --------------------------------------------------------------------------
-    for localidade, row_vals in df_dados.iterrows():
-        # Se for a seção de Cidades, insere a separação visual "Cidades" antes da lista
-        if eh_aba_cidades and localidade == df_prob_cidades.index[0]:
-            linha_subsep = ["Cidades"] + [
-                f"{meses_pt[d.month]}-{d.day:02d}" for d in df_dados.columns
-            ]
-            ws.append(linha_subsep)
+    # Dados
+    for loc, row_vals in df_dados.iterrows():
+      if eh_cidades and loc == df_cidades_completo.index[1]:
+        ws.append(["Cidades"] + [
+            f"{meses_pt[d.month]}-{d.day:02d}" for d in df_dados.columns
+        ])
+      ws.append([loc] + list(row_vals.values))
 
-        linha = [localidade] + list(row_vals.values)
-        ws.append(linha)
-
-    # --------------------------------------------------------------------------
-    # Formatação de Células, Estilos e Máscaras de Porcentagem
-    # --------------------------------------------------------------------------
+    # Formatação
     max_row = ws.max_row
     max_col = ws.max_column
 
     for r in range(1, max_row + 1):
-        primeira_celula = ws.cell(r, 1).value
+      p_cel = ws.cell(r, 1).value
+      for c in range(1, max_col + 1):
+        cell = ws.cell(r, c)
+        cell.border = thin_border
 
-        for c in range(1, max_col + 1):
-            cell = ws.cell(r, c)
-            cell.border = thin_border
+        if r in (1, 2) or p_cel == "Cidades":
+          cell.font = font_header
+          cell.fill = fill_header
+          cell.alignment = align_left if c == 1 else align_center
+        elif p_cel == "Estado de São Paulo":
+          cell.font = font_estado
+          cell.fill = fill_estado
+          cell.alignment = align_left if c == 1 else align_center
+          if c > 1:
+            cell.number_format = "0%"
+        else:
+          cell.font = font_normal
+          cell.alignment = align_left if c == 1 else align_center
+          if c > 1:
+            cell.number_format = "0%"
 
-            # Cabeçalhos
-            if r in (1, 2) or primeira_celula == "Cidades":
-                cell.font = font_header_datas
-                cell.fill = fill_header
-                cell.alignment = align_left if c == 1 else align_center
-
-            # Linha consolidada do Estado de São Paulo
-            elif primeira_celula == "Estado de São Paulo":
-                cell.font = font_estado
-                cell.fill = fill_estado
-                if c == 1:
-                    cell.alignment = align_left
-                else:
-                    cell.alignment = align_center
-                    cell.number_format = "0%"
-
-            # Linhas normais de dados (Cidades / Bairros)
-            else:
-                if c == 1:
-                    cell.font = font_normal
-                    cell.alignment = align_left
-                else:
-                    cell.font = font_normal
-                    cell.alignment = align_center
-                    cell.number_format = "0%"
-
-    # --------------------------------------------------------------------------
-    # Regra de Formatação Condicional (Escala de Cores: Verde -> Amarelo -> Vermelho)
-    # --------------------------------------------------------------------------
     color_scale = ColorScaleRule(
         start_type="num",
         start_value=0.0,
-        start_color="63BE7B",  # Verde (baixa probabilidade)
+        start_color="63BE7B",
         mid_type="num",
         mid_value=0.5,
-        mid_color="FFEB84",  # Amarelo (média probabilidade)
+        mid_color="FFEB84",
         end_type="num",
         end_value=1.0,
-        end_color="F8696B",  # Vermelho (alta probabilidade)
+        end_color="F8696B",
     )
+    col_fim = get_column_letter(max_col)
+    ws.conditional_formatting.add(f"B3:{col_fim}{max_row}", color_scale)
 
-    col_fim_letra = get_column_letter(max_col)
-    # Aplica a escala de cores apenas nas células com valores numéricos (%)
-    ws.conditional_formatting.add(f"B3:{col_fim_letra}{max_row}", color_scale)
-
-    # Ajusta largura das colunas
     ws.column_dimensions["A"].width = 28
     for c in range(2, max_col + 1):
-        ws.column_dimensions[get_column_letter(c)].width = 10
+      ws.column_dimensions[get_column_letter(c)].width = 10
+
+  ws1 = wb.active
+  ws1.title = "Cidades SP"
+  criar_aba(ws1, df_cidades_completo, eh_cidades=True)
+
+  ws2 = wb.create_sheet(title="SP Capital - Bairros")
+  criar_aba(ws2, df_prob_bairros, eh_cidades=False)
+
+  wb.save(caminho_saida)
 
 
-# ------------------------------------------------------------------------------
-# Montagem das Abas
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# ENVIO DE E-MAIL
+# ==============================================================================
+def enviar_email(caminho_arquivo):
+  remetente = os.environ.get("EMAIL_REMETENTE")
+  senha = os.environ.get("EMAIL_SENHA")
+  destinatarios_raw = os.environ.get(
+      "EMAIL_DESTINATARIOS", remetente
+  )  # fallback se não definir
+  destinatarios = [d.strip() for d in destinatarios_raw.split(",") if d.strip()]
 
-# Aba 1: Cidades SP (com linha do Estado no topo)
-ws1 = wb.active
-ws1.title = "Cidades SP"
-criar_aba_formatada(
-    ws1, df_cidades_completo, titulo_coluna_principal="Dia", eh_aba_cidades=True
-)
+  if not remetente or not senha:
+    print("ERRO: Credenciais de e-mail não configuradas no ambiente.")
+    return
 
-# Aba 2: SP Capital - Bairros
-ws2 = wb.create_sheet(title="SP Capital - Bairros")
-criar_aba_formatada(
-    ws2,
-    df_prob_bairros,
-    titulo_coluna_principal="Dia",
-    eh_aba_cidades=False,
-)
+  msg = MIMEMultipart()
+  msg["From"] = remetente
+  msg["To"] = ", ".join(destinatarios)
+  msg["Subject"] = f"Radar Meteorológico SP - {hoje.strftime('%d/%m/%Y')}"
 
-# Salva o arquivo gerado
-wb.save(ARQUIVO_SAIDA)
-print(f"Planilha gerada com sucesso: '{ARQUIVO_SAIDA}'")
+  corpo = """Olá,
 
-## 7. Baixar o arquivo
+Segue em anexo o relatório atualizado do Radar Meteorológico do Estado de São Paulo e Bairros da Capital.
 
-try:
-    from google.colab import files
-    files.download(ARQUIVO_SAIDA)
-except ImportError:
-    print(f"Ambiente fora do Google Colab — o arquivo foi salvo localmente como '{ARQUIVO_SAIDA}'.")
+Este e-mail foi gerado automaticamente.
+
+Atenciosamente,
+Equipe de Automação"""
+
+  msg.attach(MIMEText(corpo, "plain"))
+
+  with open(caminho_arquivo, "rb") as f:
+    part = MIMEApplication(f.read(), Name=os.path.basename(caminho_arquivo))
+    part[
+        "Content-Disposition"
+    ] = f'attachment; filename="{os.path.basename(caminho_arquivo)}"'
+    msg.attach(part)
+
+  with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+    server.login(remetente, senha)
+    server.sendmail(remetente, destinatarios, msg.as_string())
+
+  print(
+      f"Report enviado com sucesso para {len(destinatarios)} destinatário(s)!"
+  )
+
+
+# ==============================================================================
+# EXECUÇÃO PRINCIPAL
+# ==============================================================================
+if __name__ == "__main__":
+  print("1. Obtendo cidades via IBGE...")
+  df_cidades = buscar_cidades_sp_acima_de(POPULACAO_MINIMA)
+
+  print("2. Geocodificando localidades...")
+  coords_cidades = {}
+  for nome in df_cidades["cidade"]:
+    c = geocodificar(nome)
+    if c:
+      coords_cidades[nome] = c
+
+  print("3. Buscando previsão de chuva na Open-Meteo...")
+  df_prob_cidades = buscar_probabilidade_chuva_media(
+      coords_cidades, DATA_INICIO, DATA_FIM
+  )
+  df_prob_bairros = buscar_probabilidade_chuva_media(
+      BAIRROS_SP, DATA_INICIO, DATA_FIM
+  )
+
+  print("4. Consolidando linha do Estado de São Paulo...")
+  df_sp_media = pd.DataFrame(
+      [df_prob_cidades.mean(axis=0)],
+      index=["Estado de São Paulo"],
+      columns=df_prob_cidades.columns,
+  )
+  df_cidades_completo = pd.concat([df_sp_media, df_prob_cidades])
+
+  print("5. Gerando arquivo Excel...")
+  gerar_excel(df_cidades_completo, df_prob_bairros, ARQUIVO_SAIDA)
+
+  print("6. Enviando relatório por e-mail...")
+  enviar_email(ARQUIVO_SAIDA)
+  print("Processo concluído!")
