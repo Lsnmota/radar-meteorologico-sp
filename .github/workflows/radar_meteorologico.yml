@@ -1,0 +1,33 @@
+name: Radar Meteorologico SP - Execucao Diaria
+
+on:
+  schedule:
+    # 06:00 BRT (UTC-3) = 09:00 UTC
+    - cron: '0 9 * * *'
+  workflow_dispatch: # Permite disparar manualmente via painel do GitHub
+
+jobs:
+  run-automation:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar codigo do repositorio
+        uses: actions/checkout@v3
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Executar Script Principal
+        env:
+          EMAIL_REMETENTE: ${{ secrets.EMAIL_REMETENTE }}
+          EMAIL_SENHA: ${{ secrets.EMAIL_SENHA }}
+          EMAIL_DESTINATARIOS: ${{ secrets.EMAIL_DESTINATARIOS }}
+        run: |
+          python main.py
