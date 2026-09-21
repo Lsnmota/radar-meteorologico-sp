@@ -33,3 +33,20 @@ jobs:
           EMAIL_DESTINATARIOS: ${{ secrets.EMAIL_DESTINATARIOS }}
           DESTINATARIOS: ${{ secrets.DESTINATARIOS }}
         run: python main.py
+- name: Enviar notificação para o Telegram
+        if: always() # Executa tanto se passar quanto se falhar
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATUS: ${{ job.status }}
+        run: |
+          if [ "$STATUS" == "success" ]; then
+            MENSAGEM="✅ *Radar Meteorológico SP* executado com sucesso e e-mails disparados!"
+          else
+            MENSAGEM="❌ *ALERTA*: Falha na execução do Radar Meteorológico SP!"
+          fi
+          
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d text="${MENSAGEM}" \
+            -d parse_mode="Markdown"
