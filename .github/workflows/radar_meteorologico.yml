@@ -30,4 +30,5 @@ jobs:
           # Adicione aqui suas variáveis de ambiente / secrets caso o script utilize
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          DESTINATARIOS: ${{ secrets.DESTINATARIOS }}
         run: python main.py
