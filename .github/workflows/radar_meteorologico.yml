@@ -2,7 +2,6 @@ name: Radar Meteorológico SP
 
 on:
   schedule:
-    # 07:00 UTC = 04:00 BRT (menor carga global nas filas do GitHub Actions)
     - cron: '0 7 * * *'
   workflow_dispatch:
 
@@ -33,8 +32,9 @@ jobs:
           EMAIL_DESTINATARIOS: ${{ secrets.EMAIL_DESTINATARIOS }}
           DESTINATARIOS: ${{ secrets.DESTINATARIOS }}
         run: python main.py
-- name: Enviar notificação para o Telegram
-        if: always() # Executa tanto se passar quanto se falhar
+
+      - name: Enviar notificação para o Telegram
+        if: always()
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
