@@ -303,3 +303,9 @@ if __name__ == "__main__":
   print("6. Enviando relatório por e-mail...")
   enviar_email(ARQUIVO_SAIDA)
   print("Processo concluído!")
+
+# Exemplo de verificação explícita do envio
+with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+    server.login(usuario, senha)
+    resposta = server.sendmail(remetente, destinatarios, msg.as_string())
+    print("Resposta SMTP:", resposta)  # Se retornar dicionário vazio {}, o servidor aceitou na fila.
