@@ -340,7 +340,7 @@ def enviar_email(caminho_arquivo):
         "Segue em anexo o relatório atualizado do Radar Meteorológico.\n"
         "O arquivo contém as abas de Probabilidade de Chuva (%) e Volume Acumulado (mm) para Cidades e Bairros da Capital.\n\n"
         "Este e-mail foi gerado automaticamente.\n"
-        "Atenciosamente,\nEquipe de Automação"
+        "Atenciosamente,\nMota"
     )
     msg.attach(MIMEText(corpo, "plain"))
 
@@ -359,16 +359,38 @@ def enviar_email(caminho_arquivo):
     except Exception as e:
         print(f"FALHA NO ENVIO SMTP: {str(e)}")
         return False
+# ==============================================================================
+# NOVA FUNÇÃO: ENVIO PARA O TELEGRAM
+# ==============================================================================
+def enviar_planilha_telegram(caminho_arquivo):
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    
+    if not bot_token or not chat_id:
+        print("ERRO: Credenciais do Telegram ausentes no ambiente Python.")
+        return
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    
+    with open(caminho_arquivo, "rb") as arquivo:
+        files = {"document": arquivo}
+        data = {
+            "chat_id": chat_id,
+            "caption": "📊 *Radar Meteorológico SP*\nRelatório gerado sob demanda!",
+            "parse_mode": "Markdown"
+        }
+        resposta = requests.post(url, data=data, files=files)
+        print("Resposta envio Telegram:", resposta.json())
 
 # ==============================================================================
-# EXECUÇÃO PRINCIPAL
+# EXECUÇÃO PRINCIPAL ATUALIZADA
 # ==============================================================================
 if __name__ == "__main__":
     print("1. Obtendo cidades via IBGE...")
     df_cidades = buscar_cidades_sp_acima_de(POPULACAO_MINIMA)
     print("2. Geocodificando localidades...")
     coords_cidades = {nome: c for nome in df_cidades["cidade"] if (c := geocodificar(nome))}
-    print("3. Buscando dados meteorológicos (Probabilidade e Volume)...")
+    print("3. Buscando dados meteorológicos...")
     df_prob_cidades, df_vol_cidades = buscar_dados_chuva(coords_cidades, DATA_INICIO, DATA_FIM)
     df_prob_bairros, df_vol_bairros = buscar_dados_chuva(BAIRROS_SP, DATA_INICIO, DATA_FIM)
     print("4. Consolidando linhas do Estado...")
@@ -376,8 +398,19 @@ if __name__ == "__main__":
     df_cid_prob_completo = pd.concat([df_sp_media_prob, df_prob_cidades])
     df_sp_media_vol = pd.DataFrame([df_vol_cidades.mean(axis=0)], index=["Estado de São Paulo"], columns=df_vol_cidades.columns)
     df_cid_vol_completo = pd.concat([df_sp_media_vol, df_vol_cidades])
-    print("5. Gerando arquivo Excel com 4 abas...")
+    print("5. Gerando arquivo Excel...")
     gerar_excel(df_cid_prob_completo, df_cid_vol_completo, df_prob_bairros, df_vol_bairros, ARQUIVO_SAIDA)
-    print("6. Enviando relatório por e-mail...")
-    enviar_email(ARQUIVO_SAIDA)
+    
+    # ---------------------------------------------------------
+    # REGRA DE DECISÃO: E-MAIL OU TELEGRAM
+    # ---------------------------------------------------------
+    destino = os.environ.get("SEND_TARGET", "email")
+    
+    if destino == "telegram":
+        print("6. Execução sob demanda: Enviando arquivo APENAS para o Telegram...")
+        enviar_planilha_telegram(ARQUIVO_SAIDA)
+    else:
+        print("6. Execução agendada: Enviando relatório por e-mail...")
+        enviar_email(ARQUIVO_SAIDA)
+        
     print("Processo concluído!")
