@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: '0 7 * * *'
   workflow_dispatch:
+    inputs:
+      send_target:
+        description: 'Destino do envio (deixe vazio para email padrão)'
+        required: false
+        default: 'email'
+        type: string
 
 jobs:
   run-radar:
@@ -25,28 +31,40 @@ jobs:
 
       - name: Executar script do radar
         env:
+          # Variável de controle de fluxo
+          SEND_TARGET: ${{ github.event.inputs.send_target || 'email' }}
+          
+          # Credenciais de E-mail
           EMAIL_REMETENTE: ${{ secrets.EMAIL_REMETENTE }}
           EMAIL_SENHA: ${{ secrets.EMAIL_SENHA }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_DESTINATARIOS: ${{ secrets.EMAIL_DESTINATARIOS }}
           DESTINATARIOS: ${{ secrets.DESTINATARIOS }}
+          
+          # Credenciais do Telegram para o Python fazer o upload
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py
 
-      - name: Enviar notificação para o Telegram
+      - name: Notificação de Monitoramento no Telegram (Apenas Status)
         if: always()
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATUS: ${{ job.status }}
+          DESTINO: ${{ github.event.inputs.send_target || 'email' }}
         run: |
-          if [ "$STATUS" == "success" ]; then
-            MENSAGEM="✅ *Radar Meteorológico SP* executado com sucesso e e-mails disparados!"
-          else
-            MENSAGEM="❌ *ALERTA*: Falha na execução do Radar Meteorológico SP!"
+          # Só envia a notificação simples em texto se NÃO for uma requisição do Telegram (para evitar duplicidade)
+          if [ "$DESTINO" != "telegram" ]; then
+            if [ "$STATUS" == "success" ]; then
+              MENSAGEM="✅ *Radar Meteorológico SP* executado com sucesso e e-mails disparados!"
+            else
+              MENSAGEM="❌ *ALERTA*: Falha na execução do Radar Meteorológico SP!"
+            fi
+            
+            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              -d chat_id="${CHAT_ID}" \
+              -d text="${MENSAGEM}" \
+              -d parse_mode="Markdown"
           fi
-          
-          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d chat_id="${CHAT_ID}" \
-            -d text="${MENSAGEM}" \
-            -d parse_mode="Markdown"
