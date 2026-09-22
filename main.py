@@ -293,41 +293,20 @@ def gerar_excel(df_cidades_prob, df_cidades_vol, df_bairros_prob, df_bairros_vol
 # ==============================================================================
 # ENVIO DE E-MAIL
 # ==============================================================================
-EMAIL_REMETENTE_PADRAO = "renata.renie.brito@h-partners.com"
-LISTA_EMAILS_SEGURA = [
-    "renata.renie.brito@h-partners.com",
-    "claudinei.moriyama@huawei.com",
-    "marcelo.garcia1@huawei.com",
-    "marcio.del.santos@huawei.com",
-    "fernando.carrara.lopez@h-partners.com",
-    "glauco.zago.oliveira@h-partners.com",
-    "robson.santos.remopt@h-partners.com",
-    "jose.alex.leite@h-partners.com",
-    "janser.hugo@h-partners.com",
-    "luciano.costa1@huawei.com",
-    "simao.abrantes.estrela@huawei.com",
-    "leonardo.sacramento@huawei.com",
-    "linyugui@huawei.com",
-    "xieshulin1@huawei.com",
-    "hallyson.diego.batista@h-partners.com",
-    "thales.chinen@huawei.com",
-    "caio.cesar.carvalho@h-partners.com",
-    "marcelo.alexandre@tqi.com.br",
-    "luiz.s.mota@huawei.com"
-]
-
 def enviar_email(caminho_arquivo):
     remetente = os.environ.get("EMAIL_REMETENTE") or os.environ.get("EMAIL_USER")
     senha = os.environ.get("EMAIL_SENHA") or os.environ.get("EMAIL_PASSWORD")
     
-    destinatarios_raw = os.environ.get("EMAIL_DESTINATARIOS") or os.environ.get("DESTINATARIOS")
-    if destinatarios_raw:
-        destinatarios = [d.strip() for d in str(destinatarios_raw).split(",") if d.strip()]
-    else:
-        destinatarios = LISTA_EMAILS_SEGURA
+    # Agora puxa estritamente do Secrets. Se não existir, a lista fica vazia.
+    destinatarios_raw = os.environ.get("EMAIL_DESTINATARIOS") or os.environ.get("DESTINATARIOS") or ""
+    destinatarios = [d.strip() for d in destinatarios_raw.split(",") if d.strip()]
 
     if not remetente or not senha:
-        print("ERRO: Credenciais de e-mail (remetente/senha) ausentes no ambiente.")
+        print("ERRO: Credenciais de e-mail ausentes.")
+        return False
+        
+    if not destinatarios:
+        print("ERRO: Nenhuma lista de destinatários encontrada no GitHub Secrets.")
         return False
 
     msg = MIMEMultipart()
@@ -340,7 +319,7 @@ def enviar_email(caminho_arquivo):
         "Segue em anexo o relatório atualizado do Radar Meteorológico.\n"
         "O arquivo contém as abas de Probabilidade de Chuva (%) e Volume Acumulado (mm) para Cidades e Bairros da Capital.\n\n"
         "Este e-mail foi gerado automaticamente.\n"
-        "Atenciosamente,\nMota"
+        "Atenciosamente,\nEquipe de Automação"
     )
     msg.attach(MIMEText(corpo, "plain"))
 
