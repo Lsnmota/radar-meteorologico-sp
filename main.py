@@ -384,7 +384,7 @@ def enviar_planilha_telegram(caminho_arquivo):
 # ==============================================================================
 if __name__ == "__main__":
     print("1. Obtendo cidades via IBGE...")
-    df_cidades_ibge = obter_cidades_monitoradas()
+    df_cidades = obter_cidades_monitoradas()
     print("2. Geocodificando localidades...")
     coords_cidades = {nome: c for nome in df_cidades["cidade"] if (c := geocodificar(nome))}
     print("3. Buscando dados meteorológicos...")
