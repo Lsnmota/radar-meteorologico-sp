@@ -151,12 +151,17 @@ def obter_cidades_monitoradas():
     # Defina aqui todas as cidades do estado que você quer monitorar.
     # Você pode incluir as mesmas que já estão no COORDENADAS_ESTATICAS_SP.
     cidades = [
-        "São Paulo", "Guarulhos", "Campinas", "São Bernardo do Campo",
-        "Santo André", "Osasco", "Sorocaba", "Ribeirão Preto", 
-        "São José dos Campos", "Jandira", "Ribeirão Pires", "Birigui", 
-        "Votorantim", "Caraguatatuba", "Várzea Paulista", "Tatuí", 
-        "Barretos", "Itatiba", "Guaratinguetá", "Catanduva", "Salto", 
-        "Poá", "Ourinhos", "Paulínia", "Resende"
+        "São Paulo", "Guarulhos", "Campinas", "São Bernardo do Campo", "Santo André",
+        "Sorocaba", "Osasco", "Ribeirão Preto", "São José dos Campos", "São José do Rio Preto",
+        "Mogi das Cruzes", "Jundiaí", "Piracicaba", "Santos", "Mauá", "Diadema", "Carapicuíba",
+        "Bauru", "Itaquaquecetuba", "Franca", "Praia Grande", "São Vicente", "Barueri", "Taubaté",
+        "Suzano", "Limeira", "Guarujá", "Sumaré", "Cotia", "Taboão da Serra", "Indaiatuba", "São Carlos",
+        "Embu das Artes", "Araraquara", "Jacareí", "Americana", "Marília", "Itapevi", "Hortolândia", "Presidente Prudente",
+        "Rio Claro", "Araçatuba", "Ferraz de Vasconcelos", "Santa Bárbara d'Oeste", "Francisco Morato", "Itapecerica da Serra",
+        "Itu", "Bragança Paulista", "Pindamonhangaba", "Itapetininga", "São Caetano do Sul", "Franco da Rocha", "Mogi Guaçu",
+        "Jaú", "Botucatu", "Atibaia", "Santana de Parnaíba", "Araras", "Cubatão", "Valinhos", "Sertãozinho", "Jandira",
+        "Ribeirão Pires", "Birigui", "Votorantim", "Caraguatatuba", "Várzea Paulista", "Tatuí", "Barretos", "Itatiba",
+        "Guaratinguetá", "Catanduva", "Salto", "Poá", "Ourinhos", "Paulínia", "Resende"
     ]
     
     # Monta a estrutura exata que o restante do código espera (DataFrame com coluna 'cidade')
@@ -383,7 +388,7 @@ def enviar_planilha_telegram(caminho_arquivo):
 # EXECUÇÃO PRINCIPAL ATUALIZADA
 # ==============================================================================
 if __name__ == "__main__":
-    print("1. Obtendo cidades via IBGE...")
+    print("1. Carregando lista estática de cidades...")
     df_cidades = obter_cidades_monitoradas()
     print("2. Geocodificando localidades...")
     coords_cidades = {nome: c for nome in df_cidades["cidade"] if (c := geocodificar(nome))}
