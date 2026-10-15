@@ -143,9 +143,27 @@ COORDENADAS_ESTATICAS_SP = {
 # ==============================================================================
 # FUNÇÕES DE BUSCA DE DADOS
 # ==============================================================================
-def buscar_cidades_sp_acima_de(populacao_minima):
-    r_mun = requests.get("https://servicodados.ibge.gov.br/api/v1/localidades/estados/SP/municipios", timeout=30)
-    municipios = {str(m["id"]): m["nome"] for m in r_mun.json()}
+def obter_cidades_monitoradas():
+    """
+    Retorna um DataFrame com a lista fixa de cidades, 
+    removendo a dependência de requisições externas ao IBGE.
+    """
+    # Defina aqui todas as cidades do estado que você quer monitorar.
+    # Você pode incluir as mesmas que já estão no COORDENADAS_ESTATICAS_SP.
+    cidades = [
+        "São Paulo", "Guarulhos", "Campinas", "São Bernardo do Campo",
+        "Santo André", "Osasco", "Sorocaba", "Ribeirão Preto", 
+        "São José dos Campos", "Jandira", "Ribeirão Pires", "Birigui", 
+        "Votorantim", "Caraguatatuba", "Várzea Paulista", "Tatuí", 
+        "Barretos", "Itatiba", "Guaratinguetá", "Catanduva", "Salto", 
+        "Poá", "Ourinhos", "Paulínia", "Resende"
+    ]
+    
+    # Monta a estrutura exata que o restante do código espera (DataFrame com coluna 'cidade')
+    # A coluna população recebe 0 apenas para manter a compatibilidade caso seja chamada em outro ponto.
+    linhas = [{"cidade": nome, "populacao": 0} for nome in cidades]
+    
+    return pd.DataFrame(linhas)
     r_pop = requests.get("https://servicodados.ibge.gov.br/api/v3/agregados/6579/periodos/-1/variaveis/9324?localidades=N6[all]", timeout=60)
     pop_data = r_pop.json()
     populacao = {}
@@ -366,7 +384,7 @@ def enviar_planilha_telegram(caminho_arquivo):
 # ==============================================================================
 if __name__ == "__main__":
     print("1. Obtendo cidades via IBGE...")
-    df_cidades = buscar_cidades_sp_acima_de(POPULACAO_MINIMA)
+    df_cidades_ibge = obter_cidades_monitoradas()
     print("2. Geocodificando localidades...")
     coords_cidades = {nome: c for nome in df_cidades["cidade"] if (c := geocodificar(nome))}
     print("3. Buscando dados meteorológicos...")
