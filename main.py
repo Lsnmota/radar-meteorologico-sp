@@ -5,6 +5,7 @@ import time
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -17,18 +18,18 @@ from openpyxl.utils import get_column_letter
 # ==============================================================================
 # CONFIGURAÇÕES E PARÂMETROS
 # ==============================================================================
-hoje = dt.date.today()
+TIMEZONE = "America/Sao_Paulo"
+hoje = dt.datetime.now(ZoneInfo(TIMEZONE)).date()
 DATA_INICIO = (hoje - dt.timedelta(days=20)).strftime("%Y-%m-%d")  # D-20
 DATA_FIM = (hoje + dt.timedelta(days=14)).strftime("%Y-%m-%d")      # D+14
-TIMEZONE = "America/Sao_Paulo"
 
 ARQUIVO_TEMPLATE_QUADS = "template_radar_sp.xlsx"  # Base v2.2 com colunas A:H nas abas Quads
 ARQUIVO_SAIDA = f"radar_chuva_sp_{DATA_INICIO}_a_{DATA_FIM}.xlsx"
 
-# Parâmetros de performance da API Open-Meteo
-BATCH_SIZE = 100                 # Coordenadas por requisição (100 evita HTTP 414/429)
-PAUSA_ENTRE_LOTES = 0.4          # Segundos entre lotes
-PRECISAO_COORDENADAS = None      # None = coordenada exata (1.603 pts) | 2 = grade ~1,1 km (736 pts)
+# Parâmetros de performance e resiliência da API Open-Meteo
+BATCH_SIZE = 100                 # Coordenadas por requisição (evita HTTP 414)
+PAUSA_ENTRE_LOTES = 10.0         # Segundos entre lotes (dilui cota de ~600 coords/min)
+PRECISAO_COORDENADAS = 2         # 2 = grade ~1,1 km (~736 pts) | None = exata (~1.711 pts)
 
 BAIRROS_SP = {
     "Sé (Centro)": (-23.5505, -46.6333),
@@ -215,6 +216,8 @@ def consultar_open_meteo_em_lotes(lista_coords_unicas, data_inicio, data_fim, ti
     cache_vol = {}
 
     total_lotes = (len(lista_coords_unicas) + BATCH_SIZE - 1) // BATCH_SIZE
+    session = requests.Session()
+    session.headers.update({"User-Agent": "radar-meteorologico-sp/2.2"})
 
     for idx_lote in range(total_lotes):
         lote = lista_coords_unicas[idx_lote * BATCH_SIZE : (idx_lote + 1) * BATCH_SIZE]
@@ -229,20 +232,22 @@ def consultar_open_meteo_em_lotes(lista_coords_unicas, data_inicio, data_fim, ti
         }
 
         dados = None
-        for tentativa in range(1, 5):
+        for tentativa in range(1, 6):
             try:
-                r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=60)
+                r = session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=(15, 60))
                 if r.status_code == 429:
-                    espera = 2.0 * tentativa
-                    print(f"   [Rate Limit 429] Lote {idx_lote + 1}/{total_lotes}, aguardando {espera}s...")
+                    retry_after = r.headers.get("Retry-After")
+                    espera = max(65, int(retry_after)) if retry_after and retry_after.isdigit() else 65
+                    print(f"   [Rate Limit 429] Lote {idx_lote + 1}/{total_lotes} (tentativa {tentativa}/5), aguardando {espera}s...")
                     time.sleep(espera)
                     continue
                 r.raise_for_status()
                 dados = r.json()
                 break
             except Exception as e:
-                print(f"   [Tentativa {tentativa}/4] Erro no lote {idx_lote + 1}/{total_lotes}: {e}")
-                time.sleep(1.5 * tentativa)
+                espera = 5.0 * tentativa
+                print(f"   [Tentativa {tentativa}/5] Erro no lote {idx_lote + 1}/{total_lotes}: {e}. Aguardando {espera}s...")
+                time.sleep(espera)
 
         if dados is None:
             raise RuntimeError(f"Falha definitiva ao consultar o lote {idx_lote + 1}/{total_lotes} na Open-Meteo.")
@@ -488,124 +493,4 @@ def gerar_excel(
 # ==============================================================================
 def enviar_email(caminho_arquivo):
     remetente = os.environ.get("EMAIL_REMETENTE") or os.environ.get("EMAIL_USER")
-    senha = os.environ.get("EMAIL_SENHA") or os.environ.get("EMAIL_PASSWORD")
-    destinatarios_raw = os.environ.get("EMAIL_DESTINATARIOS") or os.environ.get("DESTINATARIOS") or ""
-    destinatarios = [d.strip() for d in destinatarios_raw.split(",") if d.strip()]
-
-    if not remetente or not senha:
-        print("ERRO: Credenciais de e-mail ausentes.")
-        return False
-    if not destinatarios:
-        print("ERRO: Nenhuma lista de destinatários encontrada no GitHub Secrets.")
-        return False
-
-    msg = MIMEMultipart()
-    msg["From"] = remetente
-    msg["To"] = ", ".join(destinatarios)
-    msg["Subject"] = f"Radar Meteorológico SP - {hoje.strftime('%d/%m/%Y')}"
-
-    corpo = (
-        "Olá,\n\n"
-        "Segue em anexo o relatório atualizado do Radar Meteorológico.\n"
-        "O arquivo contém as abas de Probabilidade de Chuva (%) e Volume Acumulado (mm) "
-        "para Cidades, Quadrantes (Quads) e Bairros da Capital.\n\n"
-        "Este e-mail foi gerado automaticamente.\n"
-        "Atenciosamente,\nEquipe de Automação"
-    )
-    msg.attach(MIMEText(corpo, "plain"))
-
-    with open(caminho_arquivo, "rb") as f:
-        part = MIMEApplication(f.read(), Name=os.path.basename(caminho_arquivo))
-        part["Content-Disposition"] = f'attachment; filename="{os.path.basename(caminho_arquivo)}"'
-        msg.attach(part)
-
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(remetente, senha)
-            resposta = server.sendmail(remetente, destinatarios, msg.as_string())
-            print(f"SMTP Server Response: {resposta}")
-        print(f"Relatório enviado com sucesso para {len(destinatarios)} destinatário(s)!")
-        return True
-    except Exception as e:
-        print(f"FALHA NO ENVIO SMTP: {str(e)}")
-        return False
-
-
-def enviar_planilha_telegram(caminho_arquivo):
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-
-    if not bot_token or not chat_id:
-        print("ERRO: Credenciais do Telegram ausentes no ambiente Python.")
-        return
-
-    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
-    with open(caminho_arquivo, "rb") as arquivo:
-        files = {"document": arquivo}
-        data = {
-            "chat_id": chat_id,
-            "caption": "📊 *Radar Meteorológico SP*\nRelatório atualizado (Cidades, Bairros e Quads)!",
-            "parse_mode": "Markdown",
-        }
-        resposta = requests.post(url, data=data, files=files, timeout=60)
-        print("Resposta envio Telegram:", resposta.json())
-
-
-# ==============================================================================
-# EXECUÇÃO PRINCIPAL
-# ==============================================================================
-if __name__ == "__main__":
-    print("1. Carregando cidades e base de Quadrantes (Quads)...")
-    df_cidades = obter_cidades_monitoradas()
-    coords_cidades = {nome: c for nome in df_cidades["cidade"] if (c := geocodificar(nome))}
-    df_quads_meta = carregar_base_quads(ARQUIVO_TEMPLATE_QUADS)
-    print(f"   -> {len(coords_cidades)} cidades | {len(BAIRROS_SP)} bairros | {len(df_quads_meta)} linhas de Quads.")
-
-    print("2. Consolidando pool único de coordenadas...")
-    pool_coords = set()
-    for lat, lon in coords_cidades.values():
-        pool_coords.add(normalizar_coord(lat, lon))
-    for lat, lon in BAIRROS_SP.values():
-        pool_coords.add(normalizar_coord(lat, lon))
-    for lat, lon in zip(df_quads_meta["LATITUDE"], df_quads_meta["LONGITUDE"]):
-        pool_coords.add(normalizar_coord(lat, lon))
-
-    lista_coords_unicas = sorted(pool_coords)
-    print(f"   -> Total de coordenadas únicas a consultar na Open-Meteo: {len(lista_coords_unicas)}")
-
-    print("3. Buscando dados meteorológicos em lotes na Open-Meteo...")
-    cache_prob, cache_vol = consultar_open_meteo_em_lotes(lista_coords_unicas, DATA_INICIO, DATA_FIM)
-
-    print("4. Distribuindo séries para Cidades, Bairros e Quads...")
-    todas_datas = list(pd.date_range(DATA_INICIO, DATA_FIM, freq="D").date)
-    df_prob_cidades, df_vol_cidades = montar_dataframes_entidades(coords_cidades, cache_prob, cache_vol, todas_datas)
-    df_prob_bairros, df_vol_bairros = montar_dataframes_entidades(BAIRROS_SP, cache_prob, cache_vol, todas_datas)
-    matriz_quads_prob, matriz_quads_vol = montar_matrizes_quads(df_quads_meta, cache_prob, cache_vol, todas_datas)
-
-    df_sp_media_prob = pd.DataFrame([df_prob_cidades.mean(axis=0)], index=["Estado de São Paulo"], columns=todas_datas)
-    df_cid_prob_completo = pd.concat([df_sp_media_prob, df_prob_cidades])
-
-    df_sp_media_vol = pd.DataFrame([df_vol_cidades.mean(axis=0)], index=["Estado de São Paulo"], columns=todas_datas)
-    df_cid_vol_completo = pd.concat([df_sp_media_vol, df_vol_cidades])
-
-    print("5. Gerando arquivo Excel (6 abas)...")
-    gerar_excel(
-        df_cid_prob_completo,
-        df_cid_vol_completo,
-        df_prob_bairros,
-        df_vol_bairros,
-        df_quads_meta,
-        matriz_quads_prob,
-        matriz_quads_vol,
-        ARQUIVO_SAIDA,
-    )
-
-    destino = os.environ.get("SEND_TARGET", "email")
-    if destino == "telegram":
-        print("6. Execução sob demanda: Enviando arquivo APENAS para o Telegram...")
-        enviar_planilha_telegram(ARQUIVO_SAIDA)
-    else:
-        print("6. Execução agendada: Enviando relatório por e-mail...")
-        enviar_email(ARQUIVO_SAIDA)
-
-    print("Processo concluído com sucesso!")
+    senha = os.environ.get("EMAIL_SENHA") or
