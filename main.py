@@ -1,16 +1,18 @@
 import datetime as dt
 import os
 import smtplib
+import time
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+
+import numpy as np
 import pandas as pd
+import requests
 from openpyxl import Workbook
 from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-import requests
-import time
 
 # ==============================================================================
 # CONFIGURAÇÕES E PARÂMETROS
@@ -18,9 +20,15 @@ import time
 hoje = dt.date.today()
 DATA_INICIO = (hoje - dt.timedelta(days=20)).strftime("%Y-%m-%d")  # D-20
 DATA_FIM = (hoje + dt.timedelta(days=14)).strftime("%Y-%m-%d")      # D+14
-POPULACAO_MINIMA = 100_000
 TIMEZONE = "America/Sao_Paulo"
+
+ARQUIVO_TEMPLATE_QUADS = "template_radar_sp.xlsx"  # Base v2.2 com colunas A:H nas abas Quads
 ARQUIVO_SAIDA = f"radar_chuva_sp_{DATA_INICIO}_a_{DATA_FIM}.xlsx"
+
+# Parâmetros de performance da API Open-Meteo
+BATCH_SIZE = 100                 # Coordenadas por requisição (100 evita HTTP 414/429)
+PAUSA_ENTRE_LOTES = 0.4          # Segundos entre lotes
+PRECISAO_COORDENADAS = None      # None = coordenada exata (1.603 pts) | 2 = grade ~1,1 km (736 pts)
 
 BAIRROS_SP = {
     "Sé (Centro)": (-23.5505, -46.6333),
@@ -57,9 +65,6 @@ BAIRROS_SP = {
     "Parelheiros": (-23.8153, -46.7517),
 }
 
-# ==============================================================================
-# DICIONÁRIO DE COORDENADAS FIXAS
-# ==============================================================================
 COORDENADAS_ESTATICAS_SP = {
     "São Paulo": (-23.5505, -46.6333),
     "Guarulhos": (-23.4628, -46.5333),
@@ -140,62 +145,45 @@ COORDENADAS_ESTATICAS_SP = {
     "Resende": (-22.4689, -44.4497),
 }
 
+
 # ==============================================================================
-# FUNÇÕES DE BUSCA DE DADOS
+# LEITURA DE LOCALIDADES E BASE QUADS
 # ==============================================================================
+def normalizar_coord(lat, lon):
+    lat_f, lon_f = float(lat), float(lon)
+    if PRECISAO_COORDENADAS is not None:
+        return (round(lat_f, PRECISAO_COORDENADAS), round(lon_f, PRECISAO_COORDENADAS))
+    return (lat_f, lon_f)
+
+
 def obter_cidades_monitoradas():
-    """
-    Retorna um DataFrame com a lista fixa de cidades, 
-    removendo a dependência de requisições externas ao IBGE.
-    """
-    # Defina aqui todas as cidades do estado que você quer monitorar.
-    # Você pode incluir as mesmas que já estão no COORDENADAS_ESTATICAS_SP.
-    cidades = [
-        "São Paulo", "Guarulhos", "Campinas", "São Bernardo do Campo", "Santo André",
-        "Sorocaba", "Osasco", "Ribeirão Preto", "São José dos Campos", "São José do Rio Preto",
-        "Mogi das Cruzes", "Jundiaí", "Piracicaba", "Santos", "Mauá", "Diadema", "Carapicuíba",
-        "Bauru", "Itaquaquecetuba", "Franca", "Praia Grande", "São Vicente", "Barueri", "Taubaté",
-        "Suzano", "Limeira", "Guarujá", "Sumaré", "Cotia", "Taboão da Serra", "Indaiatuba", "São Carlos",
-        "Embu das Artes", "Araraquara", "Jacareí", "Americana", "Marília", "Itapevi", "Hortolândia", "Presidente Prudente",
-        "Rio Claro", "Araçatuba", "Ferraz de Vasconcelos", "Santa Bárbara d'Oeste", "Francisco Morato", "Itapecerica da Serra",
-        "Itu", "Bragança Paulista", "Pindamonhangaba", "Itapetininga", "São Caetano do Sul", "Franco da Rocha", "Mogi Guaçu",
-        "Jaú", "Botucatu", "Atibaia", "Santana de Parnaíba", "Araras", "Cubatão", "Valinhos", "Sertãozinho", "Jandira",
-        "Ribeirão Pires", "Birigui", "Votorantim", "Caraguatatuba", "Várzea Paulista", "Tatuí", "Barretos", "Itatiba",
-        "Guaratinguetá", "Catanduva", "Salto", "Poá", "Ourinhos", "Paulínia", "Resende"
-    ]
-    
-    # Monta a estrutura exata que o restante do código espera (DataFrame com coluna 'cidade')
-    # A coluna população recebe 0 apenas para manter a compatibilidade caso seja chamada em outro ponto.
-    linhas = [{"cidade": nome, "populacao": 0} for nome in cidades]
-    
-    return pd.DataFrame(linhas)
-    r_pop = requests.get("https://servicodados.ibge.gov.br/api/v3/agregados/6579/periodos/-1/variaveis/9324?localidades=N6[all]", timeout=60)
-    pop_data = r_pop.json()
-    populacao = {}
-    for var in pop_data:
-        for res in var.get("resultados", []):
-            for s in res.get("series", []):
-                cod = str(s["localidade"]["id"])
-                vals = s.get("serie", {})
-                if vals:
-                    last_k = sorted(vals.keys())[-1]
-                    try:
-                        populacao[cod] = int(vals[last_k])
-                    except (TypeError, ValueError):
-                        pass
-    linhas = [
-        {"cidade": nome, "populacao": populacao.get(cod)}
-        for cod, nome in municipios.items()
-        if populacao.get(cod) and populacao.get(cod) >= populacao_minima
-    ]
-    return pd.DataFrame(linhas).sort_values("populacao", ascending=False)
+    cidades = list(COORDENADAS_ESTATICAS_SP.keys())
+    return pd.DataFrame([{"cidade": nome, "populacao": 0} for nome in cidades])
+
+
+def carregar_base_quads(caminho_template=ARQUIVO_TEMPLATE_QUADS):
+    """Lê os metadados (colunas A:H) da aba 'Quads (Prob%)' do template v2.2."""
+    if not os.path.exists(caminho_template):
+        raise FileNotFoundError(f"Template de Quads não encontrado: {caminho_template}")
+
+    df_quads = pd.read_excel(
+        caminho_template,
+        sheet_name="Quads (Prob%)",
+        header=1,
+        usecols="A:H",
+    ).dropna(subset=["LATITUDE", "LONGITUDE"])
+
+    df_quads["LATITUDE"] = pd.to_numeric(df_quads["LATITUDE"], errors="raise")
+    df_quads["LONGITUDE"] = pd.to_numeric(df_quads["LONGITUDE"], errors="raise")
+    return df_quads
+
 
 def geocodificar(nome):
     if nome in COORDENADAS_ESTATICAS_SP:
         return COORDENADAS_ESTATICAS_SP[nome]
     url = "https://geocoding-api.open-meteo.com/v1/search"
     params = {"name": nome, "count": 5, "language": "pt", "format": "json", "countryCode": "BR"}
-    for tentativa in range(1, 4):
+    for _ in range(3):
         try:
             r = requests.get(url, params=params, timeout=15)
             r.raise_for_status()
@@ -211,73 +199,179 @@ def geocodificar(nome):
             time.sleep(1.5)
     return None
 
-def buscar_dados_chuva(dict_coordenadas, data_inicio, data_fim, timezone=TIMEZONE):
-    nomes = list(dict_coordenadas.keys())
-    coords = list(dict_coordenadas.values())
-    todas_datas = list(pd.date_range(data_inicio, data_fim, freq="D").date)
-    df_prob = pd.DataFrame(index=nomes, columns=todas_datas, dtype=float)
-    df_vol = pd.DataFrame(index=nomes, columns=todas_datas, dtype=float)
-    params = {
-        "latitude": ",".join(str(c[0]) for c in coords),
-        "longitude": ",".join(str(c[1]) for c in coords),
-        "hourly": "precipitation_probability",
-        "daily": "precipitation_sum",
-        "timezone": timezone,
-        "start_date": str(data_inicio),
-        "end_date": str(data_fim),
-    }
-    r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=60)
-    dados = r.json()
-    if isinstance(dados, dict):
-        dados = [dados]
-    for nome, res in zip(nomes, dados):
-        if "hourly" in res and "precipitation_probability" in res["hourly"]:
-            df_h = pd.DataFrame({
-                "time": pd.to_datetime(res["hourly"]["time"]),
-                "prob": [p / 100.0 for p in res["hourly"]["precipitation_probability"]]
-            })
-            df_h["data"] = df_h["time"].dt.date
-            df_prob.loc[nome] = df_h.groupby("data")["prob"].mean()
-        if "daily" in res and "precipitation_sum" in res["daily"]:
-            df_d = pd.DataFrame({
-                "time": pd.to_datetime(res["daily"]["time"]),
-                "vol": res["daily"]["precipitation_sum"]
-            })
-            df_d["data"] = df_d["time"].dt.date
-            df_d.set_index("data", inplace=True)
-            df_vol.loc[nome] = df_d["vol"]
-    return df_prob, df_vol
 
 # ==============================================================================
-# GERAÇÃO DO EXCEL
+# CONSULTA UNIFICADA EM LOTE NA OPEN-METEO
 # ==============================================================================
-def gerar_excel(df_cidades_prob, df_cidades_vol, df_bairros_prob, df_bairros_vol, caminho_saida):
+def consultar_open_meteo_em_lotes(lista_coords_unicas, data_inicio, data_fim, timezone=TIMEZONE):
+    """
+    Consulta uma lista deduplicada de tuplas (lat, lon) em lotes de BATCH_SIZE,
+    retornando dois dicionários indexados por (lat, lon):
+      - cache_prob[(lat, lon)] -> pd.Series (datas -> prob 0.0..1.0)
+      - cache_vol[(lat, lon)]  -> pd.Series (datas -> vol mm)
+    """
+    todas_datas = list(pd.date_range(data_inicio, data_fim, freq="D").date)
+    cache_prob = {}
+    cache_vol = {}
+
+    total_lotes = (len(lista_coords_unicas) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for idx_lote in range(total_lotes):
+        lote = lista_coords_unicas[idx_lote * BATCH_SIZE : (idx_lote + 1) * BATCH_SIZE]
+        params = {
+            "latitude": ",".join(str(c[0]) for c in lote),
+            "longitude": ",".join(str(c[1]) for c in lote),
+            "hourly": "precipitation_probability",
+            "daily": "precipitation_sum",
+            "timezone": timezone,
+            "start_date": str(data_inicio),
+            "end_date": str(data_fim),
+        }
+
+        dados = None
+        for tentativa in range(1, 5):
+            try:
+                r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=60)
+                if r.status_code == 429:
+                    espera = 2.0 * tentativa
+                    print(f"   [Rate Limit 429] Lote {idx_lote + 1}/{total_lotes}, aguardando {espera}s...")
+                    time.sleep(espera)
+                    continue
+                r.raise_for_status()
+                dados = r.json()
+                break
+            except Exception as e:
+                print(f"   [Tentativa {tentativa}/4] Erro no lote {idx_lote + 1}/{total_lotes}: {e}")
+                time.sleep(1.5 * tentativa)
+
+        if dados is None:
+            raise RuntimeError(f"Falha definitiva ao consultar o lote {idx_lote + 1}/{total_lotes} na Open-Meteo.")
+
+        if isinstance(dados, dict):
+            dados = [dados]
+
+        for coord, res in zip(lote, dados):
+            serie_prob = pd.Series(index=todas_datas, dtype=float)
+            serie_vol = pd.Series(index=todas_datas, dtype=float)
+
+            if "hourly" in res and "precipitation_probability" in res["hourly"]:
+                probs_limpas = [
+                    (p / 100.0 if p is not None else np.nan)
+                    for p in res["hourly"]["precipitation_probability"]
+                ]
+                df_h = pd.DataFrame({
+                    "time": pd.to_datetime(res["hourly"]["time"]),
+                    "prob": probs_limpas,
+                })
+                df_h["data"] = df_h["time"].dt.date
+                serie_prob.update(df_h.groupby("data")["prob"].mean())
+
+            if "daily" in res and "precipitation_sum" in res["daily"]:
+                df_d = pd.DataFrame({
+                    "time": pd.to_datetime(res["daily"]["time"]),
+                    "vol": res["daily"]["precipitation_sum"],
+                })
+                df_d["data"] = df_d["time"].dt.date
+                serie_vol.update(df_d.set_index("data")["vol"])
+
+            cache_prob[coord] = serie_prob
+            cache_vol[coord] = serie_vol
+
+        print(f"   Lote {idx_lote + 1}/{total_lotes} concluído ({len(lote)} coordenadas).")
+        if idx_lote + 1 < total_lotes:
+            time.sleep(PAUSA_ENTRE_LOTES)
+
+    return cache_prob, cache_vol
+
+
+def montar_dataframes_entidades(dict_entidades, cache_prob, cache_vol, todas_datas):
+    nomes = list(dict_entidades.keys())
+    df_prob = pd.DataFrame(index=nomes, columns=todas_datas, dtype=float)
+    df_vol = pd.DataFrame(index=nomes, columns=todas_datas, dtype=float)
+    for nome, coord in dict_entidades.items():
+        chave = normalizar_coord(*coord)
+        df_prob.loc[nome] = cache_prob[chave]
+        df_vol.loc[nome] = cache_vol[chave]
+    return df_prob, df_vol
+
+
+def montar_matrizes_quads(df_quads_meta, cache_prob, cache_vol, todas_datas):
+    chaves = [normalizar_coord(lat, lon) for lat, lon in zip(df_quads_meta["LATITUDE"], df_quads_meta["LONGITUDE"])]
+    matriz_prob = np.vstack([cache_prob[c].reindex(todas_datas).to_numpy(dtype=float) for c in chaves])
+    matriz_vol = np.vstack([cache_vol[c].reindex(todas_datas).to_numpy(dtype=float) for c in chaves])
+    return matriz_prob, matriz_vol
+
+
+# ==============================================================================
+# GERAÇÃO DO EXCEL (6 ABAS - PADRÃO v2.2)
+# ==============================================================================
+def gerar_excel(
+    df_cidades_prob,
+    df_cidades_vol,
+    df_bairros_prob,
+    df_bairros_vol,
+    df_quads_meta,
+    matriz_quads_prob,
+    matriz_quads_vol,
+    caminho_saida,
+):
     wb = Workbook()
+
     font_header = Font(name="Calibri", size=11, bold=True, color="000000")
     font_normal = Font(name="Calibri", size=11, bold=False, color="000000")
+    font_quad_meta = Font(name="Calibri", size=10, bold=False, color="000000")
+    font_quad_hdr_azul = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+    font_quad_hdr_amar = Font(name="Calibri", size=10, bold=True, color="000000")
+
     fill_header = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
     fill_estado = PatternFill(start_color="E6EDF5", end_color="E6EDF5", fill_type="solid")
+    fill_azul = PatternFill(start_color="0070C0", end_color="0070C0", fill_type="solid")
+    fill_amarelo = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
     align_center = Alignment(horizontal="center", vertical="center")
     align_left = Alignment(horizontal="left", vertical="center")
+
     thin_border = Border(
         left=Side(style="thin", color="D9D9D9"),
         right=Side(style="thin", color="D9D9D9"),
         top=Side(style="thin", color="D9D9D9"),
-        bottom=Side(style="thin", color="D9D9D9")
+        bottom=Side(style="thin", color="D9D9D9"),
     )
-    dias_semana_pt = {"Mon": "Seg", "Tue": "Ter", "Wed": "Qua", "Thu": "Qui", "Fri": "Sex", "Sat": "Sáb", "Sun": "Dom"}
-    meses_pt = {1: "Jan", 2: "Fev", 3: "Mar", 4: "Abr", 5: "Mai", 6: "Jun", 7: "Jul", 8: "Ago", 9: "Set", 10: "Out", 11: "Nov", 12: "Dez"}
 
-    def criar_aba(ws, df_dados, eh_cidades, tipo_dado):
+    dias_semana_pt = {"Mon": "Seg", "Tue": "Ter", "Wed": "Qua", "Thu": "Qui", "Fri": "Sex", "Sat": "Sáb", "Sun": "Dom"}
+    meses_pt = {
+        1: "Jan", 2: "Fev", 3: "Mar", 4: "Abr", 5: "Mai", 6: "Jun",
+        7: "Jul", 8: "Ago", 9: "Set", 10: "Out", 11: "Nov", 12: "Dez",
+    }
+
+    def aplicar_color_scale(ws, intervalo, tipo_dado):
+        if tipo_dado == "prob":
+            rule = ColorScaleRule(
+                start_type="num", start_value=0.0, start_color="63BE7B",
+                mid_type="num", mid_value=0.5, mid_color="FFEB84",
+                end_type="num", end_value=1.0, end_color="F8696B",
+            )
+        else:
+            rule = ColorScaleRule(
+                start_type="num", start_value=0.0, start_color="63BE7B",
+                mid_type="num", mid_value=10.0, mid_color="FFEB84",
+                end_type="num", end_value=25.0, end_color="F8696B",
+            )
+        ws.conditional_formatting.add(intervalo, rule)
+
+    def criar_aba_padrao(ws, df_dados, eh_cidades, tipo_dado):
         ws.views.sheetView[0].showGridLines = True
         ws.append(["Dia"] + [dias_semana_pt.get(d.strftime("%a"), d.strftime("%a")) for d in df_dados.columns])
         ws.append(["Cidade" if eh_cidades else "Bairro"] + [f"{meses_pt[d.month]}-{d.day:02d}" for d in df_dados.columns])
+
         for loc, row_vals in df_dados.iterrows():
             if eh_cidades and loc == df_dados.index[1]:
                 ws.append(["Cidades"] + [f"{meses_pt[d.month]}-{d.day:02d}" for d in df_dados.columns])
-            ws.append([loc] + list(row_vals.values))
+            ws.append([loc] + [None if pd.isna(v) else float(v) for v in row_vals.values])
+
         max_row = ws.max_row
         max_col = ws.max_column
+
         for r in range(1, max_row + 1):
             p_cel = ws.cell(r, 1).value
             for c in range(1, max_col + 1):
@@ -293,41 +387,114 @@ def gerar_excel(df_cidades_prob, df_cidades_vol, df_bairros_prob, df_bairros_vol
                     cell.alignment = align_left if c == 1 else align_center
                 if c > 1 and isinstance(cell.value, (int, float)):
                     cell.number_format = "0%" if tipo_dado == "prob" else "0.0"
-        if tipo_dado == "prob":
-            color_scale = ColorScaleRule(start_type="num", start_value=0.0, start_color="63BE7B", mid_type="num", mid_value=0.5, mid_color="FFEB84", end_type="num", end_value=1.0, end_color="F8696B")
-        else:
-            color_scale = ColorScaleRule(start_type="num", start_value=0.0, start_color="63BE7B", mid_type="num", mid_value=10.0, mid_color="FFEB84", end_type="num", end_value=25.0, end_color="F8696B")
-        ws.conditional_formatting.add(f"B3:{get_column_letter(max_col)}{max_row}", color_scale)
+
+        aplicar_color_scale(ws, f"B3:{get_column_letter(max_col)}{max_row}", tipo_dado)
         ws.column_dimensions["A"].width = 28
         for c in range(2, max_col + 1):
             ws.column_dimensions[get_column_letter(c)].width = 10
 
+    def criar_aba_quads(ws, df_meta, matriz_valores, datas, tipo_dado):
+        ws.views.sheetView[0].showGridLines = True
+
+        # Linha 1: A1:H1 vazias; I1:AQ1 com dias da semana
+        ws.append([None] * 8 + [dias_semana_pt.get(d.strftime("%a"), d.strftime("%a")) for d in datas])
+
+        # Linha 2: Metadados A2:H2 + datas I2:AQ2
+        cabecalho_meta = list(df_meta.columns[:8])
+        ws.append(cabecalho_meta + [f"{meses_pt[d.month]}-{d.day:02d}" for d in datas])
+
+        # Linhas 3..N: Metadados + série meteorológica
+        meta_rows = df_meta.iloc[:, :8].where(pd.notna(df_meta.iloc[:, :8]), None).values.tolist()
+        for meta_row, vals_row in zip(meta_rows, matriz_valores):
+            ws.append(meta_row + [None if np.isnan(v) else float(v) for v in vals_row])
+
+        max_row = ws.max_row
+        max_col = ws.max_column
+
+        # Estilização Linha 1 (apenas colunas >= 9)
+        for c in range(9, max_col + 1):
+            cell = ws.cell(1, c)
+            cell.font = font_header
+            cell.fill = fill_header
+            cell.alignment = align_center
+            cell.border = thin_border
+
+        # Estilização Linha 2
+        for c in range(1, max_col + 1):
+            cell = ws.cell(2, c)
+            cell.border = thin_border
+            cell.alignment = align_center
+            if c <= 3:
+                cell.font = font_quad_hdr_azul
+                cell.fill = fill_azul
+            elif c <= 8:
+                cell.font = font_quad_hdr_amar
+                cell.fill = fill_amarelo
+            else:
+                cell.font = font_header
+                cell.fill = fill_header
+
+        # Estilização Linhas de Dados (3..max_row)
+        num_fmt = "0%" if tipo_dado == "prob" else "0.0"
+        for r in range(3, max_row + 1):
+            for c in range(1, max_col + 1):
+                cell = ws.cell(r, c)
+                cell.border = thin_border
+                cell.alignment = align_center
+                if c <= 8:
+                    cell.font = font_quad_meta
+                    if c == 2:
+                        cell.number_format = "0"
+                else:
+                    cell.font = font_normal
+                    if isinstance(cell.value, (int, float)):
+                        cell.number_format = num_fmt
+
+        aplicar_color_scale(ws, f"I3:{get_column_letter(max_col)}{max_row}", tipo_dado)
+
+        larguras_meta = {"A": 12, "B": 5, "C": 12, "D": 48, "E": 38, "F": 13, "G": 13, "H": 31}
+        for col_letra, largura in larguras_meta.items():
+            ws.column_dimensions[col_letra].width = largura
+        for c in range(9, max_col + 1):
+            ws.column_dimensions[get_column_letter(c)].width = 11
+
+    # Ordem exata das abas conforme template v2.2
+    datas_regua = list(df_cidades_prob.columns)
+
     ws1 = wb.active
     ws1.title = "Cidades (Prob%)"
-    criar_aba(ws1, df_cidades_prob, True, "prob")
-    ws2 = wb.create_sheet(title="Cidades (Vol mm)")
-    criar_aba(ws2, df_cidades_vol, True, "vol")
-    ws3 = wb.create_sheet(title="Bairros (Prob%)")
-    criar_aba(ws3, df_bairros_prob, False, "prob")
-    ws4 = wb.create_sheet(title="Bairros (Vol mm)")
-    criar_aba(ws4, df_bairros_vol, False, "vol")
+    criar_aba_padrao(ws1, df_cidades_prob, True, "prob")
+
+    ws2 = wb.create_sheet(title="Quads (Prob%)")
+    criar_aba_quads(ws2, df_quads_meta, matriz_quads_prob, datas_regua, "prob")
+
+    ws3 = wb.create_sheet(title="Quads (Vol mm)")
+    criar_aba_quads(ws3, df_quads_meta, matriz_quads_vol, datas_regua, "vol")
+
+    ws4 = wb.create_sheet(title="Cidades (Vol mm)")
+    criar_aba_padrao(ws4, df_cidades_vol, True, "vol")
+
+    ws5 = wb.create_sheet(title="Bairros (Prob%)")
+    criar_aba_padrao(ws5, df_bairros_prob, False, "prob")
+
+    ws6 = wb.create_sheet(title="Bairros (Vol mm)")
+    criar_aba_padrao(ws6, df_bairros_vol, False, "vol")
+
     wb.save(caminho_saida)
 
+
 # ==============================================================================
-# ENVIO DE E-MAIL
+# ENVIO DE E-MAIL E TELEGRAM
 # ==============================================================================
 def enviar_email(caminho_arquivo):
     remetente = os.environ.get("EMAIL_REMETENTE") or os.environ.get("EMAIL_USER")
     senha = os.environ.get("EMAIL_SENHA") or os.environ.get("EMAIL_PASSWORD")
-    
-    # Agora puxa estritamente do Secrets. Se não existir, a lista fica vazia.
     destinatarios_raw = os.environ.get("EMAIL_DESTINATARIOS") or os.environ.get("DESTINATARIOS") or ""
     destinatarios = [d.strip() for d in destinatarios_raw.split(",") if d.strip()]
 
     if not remetente or not senha:
         print("ERRO: Credenciais de e-mail ausentes.")
         return False
-        
     if not destinatarios:
         print("ERRO: Nenhuma lista de destinatários encontrada no GitHub Secrets.")
         return False
@@ -336,11 +503,12 @@ def enviar_email(caminho_arquivo):
     msg["From"] = remetente
     msg["To"] = ", ".join(destinatarios)
     msg["Subject"] = f"Radar Meteorológico SP - {hoje.strftime('%d/%m/%Y')}"
-    
+
     corpo = (
         "Olá,\n\n"
         "Segue em anexo o relatório atualizado do Radar Meteorológico.\n"
-        "O arquivo contém as abas de Probabilidade de Chuva (%) e Volume Acumulado (mm) para Cidades e Bairros da Capital.\n\n"
+        "O arquivo contém as abas de Probabilidade de Chuva (%) e Volume Acumulado (mm) "
+        "para Cidades, Quadrantes (Quads) e Bairros da Capital.\n\n"
         "Este e-mail foi gerado automaticamente.\n"
         "Atenciosamente,\nEquipe de Automação"
     )
@@ -361,58 +529,83 @@ def enviar_email(caminho_arquivo):
     except Exception as e:
         print(f"FALHA NO ENVIO SMTP: {str(e)}")
         return False
-# ==============================================================================
-# NOVA FUNÇÃO: ENVIO PARA O TELEGRAM
-# ==============================================================================
+
+
 def enviar_planilha_telegram(caminho_arquivo):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    
+
     if not bot_token or not chat_id:
         print("ERRO: Credenciais do Telegram ausentes no ambiente Python.")
         return
 
     url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
-    
     with open(caminho_arquivo, "rb") as arquivo:
         files = {"document": arquivo}
         data = {
             "chat_id": chat_id,
-            "caption": "📊 *Radar Meteorológico SP*\nRelatório gerado sob demanda!",
-            "parse_mode": "Markdown"
+            "caption": "📊 *Radar Meteorológico SP*\nRelatório atualizado (Cidades, Bairros e Quads)!",
+            "parse_mode": "Markdown",
         }
-        resposta = requests.post(url, data=data, files=files)
+        resposta = requests.post(url, data=data, files=files, timeout=60)
         print("Resposta envio Telegram:", resposta.json())
 
+
 # ==============================================================================
-# EXECUÇÃO PRINCIPAL ATUALIZADA
+# EXECUÇÃO PRINCIPAL
 # ==============================================================================
 if __name__ == "__main__":
-    print("1. Carregando lista estática de cidades...")
+    print("1. Carregando cidades e base de Quadrantes (Quads)...")
     df_cidades = obter_cidades_monitoradas()
-    print("2. Geocodificando localidades...")
     coords_cidades = {nome: c for nome in df_cidades["cidade"] if (c := geocodificar(nome))}
-    print("3. Buscando dados meteorológicos...")
-    df_prob_cidades, df_vol_cidades = buscar_dados_chuva(coords_cidades, DATA_INICIO, DATA_FIM)
-    df_prob_bairros, df_vol_bairros = buscar_dados_chuva(BAIRROS_SP, DATA_INICIO, DATA_FIM)
-    print("4. Consolidando linhas do Estado...")
-    df_sp_media_prob = pd.DataFrame([df_prob_cidades.mean(axis=0)], index=["Estado de São Paulo"], columns=df_prob_cidades.columns)
+    df_quads_meta = carregar_base_quads(ARQUIVO_TEMPLATE_QUADS)
+    print(f"   -> {len(coords_cidades)} cidades | {len(BAIRROS_SP)} bairros | {len(df_quads_meta)} linhas de Quads.")
+
+    print("2. Consolidando pool único de coordenadas...")
+    pool_coords = set()
+    for lat, lon in coords_cidades.values():
+        pool_coords.add(normalizar_coord(lat, lon))
+    for lat, lon in BAIRROS_SP.values():
+        pool_coords.add(normalizar_coord(lat, lon))
+    for lat, lon in zip(df_quads_meta["LATITUDE"], df_quads_meta["LONGITUDE"]):
+        pool_coords.add(normalizar_coord(lat, lon))
+
+    lista_coords_unicas = sorted(pool_coords)
+    print(f"   -> Total de coordenadas únicas a consultar na Open-Meteo: {len(lista_coords_unicas)}")
+
+    print("3. Buscando dados meteorológicos em lotes na Open-Meteo...")
+    cache_prob, cache_vol = consultar_open_meteo_em_lotes(lista_coords_unicas, DATA_INICIO, DATA_FIM)
+
+    print("4. Distribuindo séries para Cidades, Bairros e Quads...")
+    todas_datas = list(pd.date_range(DATA_INICIO, DATA_FIM, freq="D").date)
+    df_prob_cidades, df_vol_cidades = montar_dataframes_entidades(coords_cidades, cache_prob, cache_vol, todas_datas)
+    df_prob_bairros, df_vol_bairros = montar_dataframes_entidades(BAIRROS_SP, cache_prob, cache_vol, todas_datas)
+    matriz_quads_prob, matriz_quads_vol = montar_matrizes_quads(df_quads_meta, cache_prob, cache_vol, todas_datas)
+
+    df_sp_media_prob = pd.DataFrame([df_prob_cidades.mean(axis=0)], index=["Estado de São Paulo"], columns=todas_datas)
     df_cid_prob_completo = pd.concat([df_sp_media_prob, df_prob_cidades])
-    df_sp_media_vol = pd.DataFrame([df_vol_cidades.mean(axis=0)], index=["Estado de São Paulo"], columns=df_vol_cidades.columns)
+
+    df_sp_media_vol = pd.DataFrame([df_vol_cidades.mean(axis=0)], index=["Estado de São Paulo"], columns=todas_datas)
     df_cid_vol_completo = pd.concat([df_sp_media_vol, df_vol_cidades])
-    print("5. Gerando arquivo Excel...")
-    gerar_excel(df_cid_prob_completo, df_cid_vol_completo, df_prob_bairros, df_vol_bairros, ARQUIVO_SAIDA)
-    
-    # ---------------------------------------------------------
-    # REGRA DE DECISÃO: E-MAIL OU TELEGRAM
-    # ---------------------------------------------------------
+
+    print("5. Gerando arquivo Excel (6 abas)...")
+    gerar_excel(
+        df_cid_prob_completo,
+        df_cid_vol_completo,
+        df_prob_bairros,
+        df_vol_bairros,
+        df_quads_meta,
+        matriz_quads_prob,
+        matriz_quads_vol,
+        ARQUIVO_SAIDA,
+    )
+
     destino = os.environ.get("SEND_TARGET", "email")
-    
     if destino == "telegram":
         print("6. Execução sob demanda: Enviando arquivo APENAS para o Telegram...")
         enviar_planilha_telegram(ARQUIVO_SAIDA)
     else:
         print("6. Execução agendada: Enviando relatório por e-mail...")
         enviar_email(ARQUIVO_SAIDA)
-        
-    print("Processo concluído!")
+
+    print("Processo concluído com sucesso!")
